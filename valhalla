@@ -1,0 +1,173 @@
+#!/usr/bin/python3
+import os
+import sys
+import subprocess
+
+import xml.etree.ElementTree as ET
+from collections import namedtuple
+Frame = namedtuple('Frame', ['file', 'function', 'line', 'local'])
+Error = namedtuple('Error', ['stack', 'err_type', 'err_exp'])
+from colorama import *
+init()
+
+KIND = 'kind'
+STACK = 'stack'
+ERROR = 'error'
+FRAME = 'frame'
+
+VALHALLA_HEADER = f"{Style.BRIGHT+Fore.WHITE}[VALHALLA]{Style.RESET_ALL}"
+
+def is_local_obj(o):
+    """
+    Takes some string o, which represents a path.
+    Determines if that path contains a "local" object 
+    (that is, one written by the user).
+    """
+    return not any([
+        o is None,
+        o == "",
+        "../sysdeps" in o,
+        o.startswith("/usr/"),
+        o.startswith("/build/"),
+        ".so" in o[-6:],
+        "system-suppplied" in o,
+    ])
+
+def get_stack(stack_xml):
+    """
+    Takes some XML node, which is a stack tag in an error
+    Returns a sequence of Frame tuples which represent that stack.
+    """
+    stack = []
+    for frame in stack_xml.findall(FRAME):
+        frame_file = frame.find('file').text
+        frame_line = frame.find('line').text
+        frame_function = frame.find('fn').text
+        frame_local = is_local_obj(frame.find('obj').text)
+        stack.append(Frame(frame_file, frame_function, frame_line, frame_local))
+    return stack
+
+def get_relevant_func(stack):
+    """
+    given a stack, return the most relevant function.
+    Example:
+    <random_internal_func>
+    > printf
+    user_function
+    main
+    
+    the relevant function here is printf.
+
+    Example:
+    <seg fault>
+    > user_function
+    main
+    
+    the most relevant function is the user's.
+    """
+
+    foriegn_func = None
+    for frame in stack:
+        if frame.local and foriegn_func is None:
+            user_func = frame.function
+            return user_func
+        elif frame.local:
+            return foriegn_func
+        foriegn_func = frame.function
+
+
+
+def memcheck_overlap(error):
+    def match(error):
+        return error.find(KIND).text == "Overlap"
+
+    if not match(error):
+        return None
+
+    stack = get_stack(error.find(STACK))
+    func = get_relevant_func(stack)
+    err_type = "Memory Copy overlaps!"
+    err_exp = f"You tried to use {func} to copy memory, but your source overlapped with your destination. Try using memmove/strmove if you wanted to overlap, or check that the memory regions don't overlap"
+    return Error(stack, err_type, err_exp)
+
+
+memcheck_explainations = {
+    memcheck_overlap
+}
+
+def get_location(stack):
+    for frame in stack:
+        if frame.local:
+            return f"{frame.file}({frame.function}):{frame.line}"
+
+ERROR_FORMAT = f"""
+{Style.BRIGHT+Fore.RED}{{error_type}}{Style.RESET_ALL} at {{location}}
+{Style.BRIGHT}Explaination:{Style.RESET_ALL} {{general_explaination}}
+{Style.BRIGHT}Error occured at:{Style.RESET_ALL}
+{{stack_trace}}
+
+"""
+
+VALGRIND_XML = "/tmp/.valhalla.xml"
+VALGRIND_CMD = "valgrind --leak-check=full --show-leak-kinds=all --xml=yes --xml-file={tmp} --track-origins=yes {args}"
+
+
+def pretty_print_stack(stack):
+    lines = []
+    first_local = True
+    for frame in stack:
+        line = ""
+        if not frame.local:
+            line += f"{Style.DIM}\t"
+        elif frame.local and first_local:
+            first_local = False
+            line += f"{Fore.BLUE}->\t{Style.RESET_ALL}"
+        line += f"in {frame.function} at {frame.file}:{frame.line}"
+        line += f"{Style.RESET_ALL}"
+        lines.append(line)
+    
+    lines.reverse()
+    return '\n'.join(lines)
+
+if __name__ == "__main__":
+    print(f"{Style.BRIGHT}"+"="*15+"[ VALHALLA ]"+"="*15+f"{Style.RESET_ALL}")
+    print(f"{Style.DIM}Valhalla was created by @tfpk in 2018.{Style.RESET_ALL}")
+    start_from = 1
+    tree = None
+    if sys.argv[start_from] == '--xml-file':
+        print(f"{VALHALLA_HEADER} Loading from existing xml file.")
+        start_from += 1
+        xml_debug_file = sys.argv[start_from]
+        tree = ET.parse(xml_debug_file)
+    else:
+        args = ' '.join(sys.argv[start_from:])
+        print(f"{VALHALLA_HEADER} running valgrind {args}.")
+       
+        command = VALGRIND_CMD.format(tmp=VALGRIND_XML, args=args)
+        try:
+            command_output = str(subprocess.check_output(command, shell=True))
+        except subprocess.CalledProcessError:
+            print(f"{VALHALLA} Calling valgrind failed.")
+            sys.exit(1)
+
+        tree = ET.parse(VALGRIND_XML)
+
+    errors = []
+
+    for error_xml in tree.findall(ERROR):
+        for exp in memcheck_explainations:
+            result = exp(error_xml)
+            if result is None:
+                continue
+            errors.append(result)
+    
+    for error in errors:
+        format_dict = {}
+        format_dict['error_type'] = error.err_type
+        format_dict['location'] = get_location(error.stack)
+        format_dict['general_explaination'] = error.err_exp
+        format_dict['stack_trace'] = pretty_print_stack(error.stack)
+        print(ERROR_FORMAT.format(**format_dict))
+
+    
+    
