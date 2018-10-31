@@ -1,12 +1,16 @@
 #!/usr/bin/python3
+import re
 import os
 import sys
 import subprocess
+import traceback
 
 import xml.etree.ElementTree as ET
 from collections import namedtuple
 Frame = namedtuple('Frame', ['file', 'function', 'line', 'local'])
-Error = namedtuple('Error', ['stack', 'err_type', 'err_exp'])
+Error = namedtuple('Error', ['xml', 'unique', 'stack', 'err_type', 'err_exp'])
+CouldNotCompute = namedtuple('CouldNotCompute', ['handler', 'traceback'])
+
 from colorama import *
 init()
 
@@ -14,8 +18,13 @@ KIND = 'kind'
 STACK = 'stack'
 ERROR = 'error'
 FRAME = 'frame'
+WHAT = 'what'
+AUXWHAT = 'auxwhat'
+UNIQUE = 'unique'
 
 VALHALLA_HEADER = f"{Style.BRIGHT+Fore.WHITE}[VALHALLA]{Style.RESET_ALL}"
+
+# helper model functions
 
 def is_local_obj(o):
     """
@@ -40,10 +49,14 @@ def get_stack(stack_xml):
     """
     stack = []
     for frame in stack_xml.findall(FRAME):
-        frame_file = frame.find('file').text
-        frame_line = frame.find('line').text
-        frame_function = frame.find('fn').text
         frame_local = is_local_obj(frame.find('obj').text)
+        frame_function = frame.find('fn').text
+        if frame_local:
+            frame_file = frame.find('file').text
+            frame_line = frame.find('line').text
+        else:
+            frame_file = "system_file"
+            frame_line = frame_function
         stack.append(Frame(frame_file, frame_function, frame_line, frame_local))
     return stack
 
@@ -76,41 +89,24 @@ def get_relevant_func(stack):
         foriegn_func = frame.function
 
 
-
-def memcheck_overlap(error):
-    def match(error):
-        return error.find(KIND).text == "Overlap"
-
-    if not match(error):
-        return None
-
-    stack = get_stack(error.find(STACK))
-    func = get_relevant_func(stack)
-    err_type = "Memory Copy overlaps!"
-    err_exp = f"You tried to use {func} to copy memory, but your source overlapped with your destination. Try using memmove/strmove if you wanted to overlap, or check that the memory regions don't overlap"
-    return Error(stack, err_type, err_exp)
+def read_relative_locations(aux_what):
+    FIELDS = ['num', 'relative', 'size', 'func']
+    RelativeLocation = namedtuple('RelativeLocation', FIELDS)
+    alloc_re = r"Address 0x[0-9a-f]* is (?P<num>\d*) bytes (?P<relative>\w*) a block of size (?P<size>\d*) (?P<func>\w*)'d"
+    match = re.match(alloc_re, aux_what)
+    if match is None:
+        return match
+    return RelativeLocation(*[match.group(x) for x in FIELDS])
 
 
-memcheck_explainations = {
-    memcheck_overlap
-}
+# helper view functions
 
 def get_location(stack):
     for frame in stack:
         if frame.local:
             return f"{frame.file}({frame.function}):{frame.line}"
-
-ERROR_FORMAT = f"""
-{Style.BRIGHT+Fore.RED}{{error_type}}{Style.RESET_ALL} at {{location}}
-{Style.BRIGHT}Explaination:{Style.RESET_ALL} {{general_explaination}}
-{Style.BRIGHT}Error occured at:{Style.RESET_ALL}
-{{stack_trace}}
-
-"""
-
-VALGRIND_XML = "/tmp/.valhalla.xml"
-VALGRIND_CMD = "valgrind --leak-check=full --show-leak-kinds=all --xml=yes --xml-file={tmp} --track-origins=yes {args}"
-
+    else:
+        return "No local functions."
 
 def pretty_print_stack(stack):
     lines = []
@@ -118,16 +114,238 @@ def pretty_print_stack(stack):
     for frame in stack:
         line = ""
         if not frame.local:
-            line += f"{Style.DIM}\t"
+            line += f"{Style.DIM}"
         elif frame.local and first_local:
             first_local = False
-            line += f"{Fore.BLUE}->\t{Style.RESET_ALL}"
-        line += f"in {frame.function} at {frame.file}:{frame.line}"
+            line += f"{Fore.BLUE}->{Style.RESET_ALL}"
+        line += f"\tin {frame.function} at {frame.file}:{frame.line}"
         line += f"{Style.RESET_ALL}"
         lines.append(line)
     
     lines.reverse()
     return '\n'.join(lines)
+
+# memcheck error definitions
+
+def memcheck_overlap(error_xml):
+    def match(error_xml):
+        return error_xml.find(KIND).text == "Overlap"
+
+    if not match(error_xml):
+        return None
+    
+    unique = error_xml.find(UNIQUE).text
+
+    stack = get_stack(error_xml.find(STACK))
+    func = get_relevant_func(stack)
+    err_type = "Memory Copy overlaps!"
+    err_exp = f"You tried to use {func} to copy memory, but your source overlapped with your destination. Try using memmove/strmove if you wanted to overlap, or check that the memory regions don't overlap"
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+
+def memcheck_double_free(error_xml):
+    def match(error_xml):
+        stacks = list(error_xml.findall(STACK))
+        return error_xml.find(KIND).text == "InvalidFree" and len(stacks) == 3
+    
+    if not match(error_xml):
+        return None
+
+    unique = error_xml.find(UNIQUE).text
+
+    stacks = list(error_xml.findall(STACK))
+    stack, free_stack, alloc_stack = map(get_stack, stacks)
+    
+    err_type = "Double Free"
+    err_exp = f"You tried to free memory, and it failed. The memory you freed was already freed previously, here:\n{pretty_print_stack(free_stack)}\n"
+    err_exp += f"You should check to make sure your memory is only freed once. \n\nNOTE: the memory you freed was declared here:\n{pretty_print_stack(alloc_stack)}\n"
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+
+def memcheck_invalid_free(error_xml):
+    def match(error_xml):
+        stacks = list(error_xml.findall(STACK))
+        return error_xml.find(KIND).text == "InvalidFree" and len(stacks) > 1
+
+    if not match(error_xml):
+        return None
+
+    unique = error_xml.find(UNIQUE).text
+    
+    xml_stacks = list(error_xml.findall(STACK))
+    stack, alloc_stack = map(get_stack, xml_stacks[:2])
+    
+    match = read_relative_locations(error_xml.find(AUXWHAT).text)
+    if match is None:
+        return None
+
+    err_type = "Invalid Free"
+    err_exp = f"You tried to free memory, and it failed because you {match.func}'d {match.size} bytes, but the address you tried to free was {match.num} {match.relative} that. You can only call free with the exact same address you got from allocation. Check you don't modify the pointer you're freeing. {Style.BRIGHT}You allocated the memory here:{Style.RESET_ALL}\n{pretty_print_stack(alloc_stack)}"
+    
+    if match.num == "0" and match.relative == "inside" and len(xml_stacks) == 3:
+        # means it was only a free error
+        return None
+
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+def memcheck_stack_free(error_xml):
+    def match(error_xml):
+        stacks = list(error_xml.findall(STACK))
+        return error_xml.find(KIND).text == "InvalidFree" and "stack" in error_xml.find(AUXWHAT).text
+
+    if not match(error_xml):
+        return None
+
+    unique = error_xml.find(UNIQUE).text
+    
+    stack = get_stack(error_xml.find(STACK))
+
+    aux_whats = list(error_xml.findall(AUXWHAT))
+    
+    err_type = "Invalid Free On Stack"
+    location = aux_whats[1].text
+    err_exp = f"You tried to free memory, but that memory is defined on the stack. You can only free memory on the heap (allocated by malloc/calloc) It was defined {location}."
+   
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+def memcheck_fishy(error_xml):
+    def match(error_xml):
+        return error_xml.find(KIND).text == "FishyValue"
+
+    if not match(error_xml):
+        return None
+    
+    unique = error_xml.find(UNIQUE).text
+    
+    stack = get_stack(error_xml.find(STACK))
+    
+    what = error_xml.find(WHAT).text.replace('\n', '')
+
+    err_type = "Fishy Value"
+    err_exp = f"You called a system function with a value that doesn't make sense ({Style.DIM+what+Style.RESET_ALL})"
+    
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+
+
+def memcheck_invalid_access(error_xml):
+    def match(error_xml):
+        return error_xml.find(KIND).text in ["InvalidRead", "InvalidWrite"]
+
+    if not match(error_xml):
+        return None
+
+    access_types = {
+        'InvalidRead': 'read',
+        'InvalidWrite': 'write',
+    }
+    access = access_types[error_xml.find(KIND).text]
+
+    unique = error_xml.find(UNIQUE).text
+    
+    xml_stacks = error_xml.findall(STACK)
+    stack, created_stack = map(get_stack, xml_stacks)
+    
+    match = read_relative_locations(error_xml.find(AUXWHAT).text)
+    if match is None:
+        return None
+
+    err_type = "Invalid Write"
+    err_exp = f"You tried to {access} memory in a place which is not allowed (you tried to access {match.num} bytes {match.relative} the {match.size} bytes {match.func}'d). Ensure you alloc enough space, or make sure you never {access} outside the space.\n{Style.BRIGHT}You allocated the memory here:{Style.RESET_ALL}\n{pretty_print_stack(created_stack)}"
+    
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+
+def memcheck_definitely_lost(error_xml):
+    def match(error_xml):
+        return error_xml.find(KIND).text == "Leak_DefinitelyLost"
+
+    if not match(error_xml):
+        return None
+
+    unique = error_xml.find(UNIQUE).text
+    
+    stack = get_stack(error_xml.find(STACK))
+
+    
+    err_type = "Directly Lost Memory"
+    err_exp = ("Your program has a memory leak. In this case, the leak is direct. \nThat means that the memory is directly accessible through a variable in code."
+               "This usually indicates memory at the head of a data structure, or a string or array, that has not been free'd\n" 
+               "You should free all memory that you allocate, or that a function you call allocates and returns. The place the memory is allocated is shown below.")
+    
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+def memcheck_indirectly_lost(error_xml):
+    def match(error_xml):
+        return error_xml.find(KIND).text == "Leak_IndirectlyLost"
+
+    if not match(error_xml):
+        return None
+
+    unique = error_xml.find(UNIQUE).text
+    
+    stack = get_stack(error_xml.find(STACK))
+
+    
+    err_type = "Indirectly Lost Memory"
+    err_exp = ("Your program has a memory leak. In this case, the leak is indirect. \nThat means that it is only referenced by another allocated block."
+               "This usually indicates memory that is part of a data structure (linked list, tree, etc.) that has not been free'd\n" 
+               "You should free all memory that you allocate, or that a function you call allocates and returns. The place the memory is allocated is shown below.")
+    
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+memcheck_explainations = [
+    memcheck_overlap,
+    memcheck_invalid_free,
+    memcheck_double_free,
+    memcheck_stack_free,
+    memcheck_fishy,
+    memcheck_invalid_access,
+    memcheck_definitely_lost,
+    memcheck_indirectly_lost,
+]
+
+# View
+
+VALGRIND_ERROR_HEADER = "=={pid}== {error}\n"
+
+def get_valgrind_error_text(error_xml, pid):
+    error_text = ""
+    what_xml = error_xml.find('what')
+    if what_xml is None:
+        what_xml = error_xml.find('xwhat').find('text')
+    error_text += VALGRIND_ERROR_HEADER.format(
+        pid=pid,
+        error=what_xml.text
+    )
+    for error in error_xml.findall(AUXWHAT):
+        error_text += VALGRIND_ERROR_HEADER.format(
+            pid=pid,
+            error=error.text
+        )
+    error_text += VALGRIND_ERROR_HEADER.format(
+        pid=pid,
+        error="[Stack traces have been extracted and printed below.]"
+    )
+    return error_text
+
+    
+def get_error_count(count, total):
+    pctg = (count / total * 100)
+    return f"{Style.BRIGHT}{count}{Style.RESET_ALL} errors like this occured ({pctg:.2f}% of all {total} errors)"
+
+ERROR_FORMAT = f"""
+{Style.BRIGHT+Fore.RED}{{error_type}}{Style.RESET_ALL} at {{location}}
+{{error}}
+{Style.BRIGHT}Explaination:{Style.RESET_ALL} {{general_explaination}}
+{Style.BRIGHT}Error occured at:{Style.RESET_ALL}
+{{stack_trace}}
+{{error_count}}
+~~~"""
+
+VALGRIND_XML = "/tmp/.valhalla.xml"
+VALGRIND_CMD = "valgrind --leak-check=full --show-leak-kinds=all --xml=yes --xml-file={tmp} --track-origins=yes {args}"
+
 
 if __name__ == "__main__":
     print(f"{Style.BRIGHT}"+"="*15+"[ VALHALLA ]"+"="*15+f"{Style.RESET_ALL}")
@@ -147,27 +365,56 @@ if __name__ == "__main__":
         try:
             command_output = str(subprocess.check_output(command, shell=True))
         except subprocess.CalledProcessError:
-            print(f"{VALHALLA} Calling valgrind failed.")
+            print(f"{VALHALLA_HEADER} Calling valgrind failed.")
             sys.exit(1)
 
         tree = ET.parse(VALGRIND_XML)
 
+    pid = tree.find("pid").text
+
     errors = []
 
     for error_xml in tree.findall(ERROR):
+        errors_found = 0
         for exp in memcheck_explainations:
-            result = exp(error_xml)
-            if result is None:
-                continue
-            errors.append(result)
+            try:
+                result = exp(error_xml)
+                if result is not None:
+                    errors.append(result)
+                    errors_found += 1
+            except Exception as e:
+                result = CouldNotCompute(exp.__name__, traceback.format_exc())
+                errors.append(result)
+        if not errors_found:
+            errors.append(error_xml)
+    
+    err_count = {}
+    num_errors = 0
+    for pair in tree.find("errorcounts").findall("pair"):
+        count= int(pair.find("count").text)
+        err_count[pair.find("unique").text] = count
+        num_errors += count
     
     for error in errors:
+        if not isinstance(error, tuple):
+            print(f"{VALHALLA_HEADER} This error was not recognised by valhalla. Please report it!")
+            ET.dump(error)
+            continue
+        if hasattr(error, 'traceback'):
+            # is error
+            print(f"{VALHALLA_HEADER} The handler for this error ({error.handler}) had a bug. Please report it!")
+            print(error.traceback)
+            continue
+
         format_dict = {}
         format_dict['error_type'] = error.err_type
         format_dict['location'] = get_location(error.stack)
+        format_dict['error'] = get_valgrind_error_text(error.xml, pid)
         format_dict['general_explaination'] = error.err_exp
         format_dict['stack_trace'] = pretty_print_stack(error.stack)
+        if error.unique in err_count:
+            format_dict['error_count'] = get_error_count(err_count[error.unique], num_errors)
+        else:
+            format_dict['error_count'] = ""
         print(ERROR_FORMAT.format(**format_dict))
 
-    
-    
