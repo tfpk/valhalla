@@ -23,6 +23,12 @@ valhalla ./my_program
 
 ## Tests
 
+To see the program in action:
+```
+gcc -g -o demo valhalla_tests/demo.c
+./valhalla ./demo
+```
+
 Valhalla will eventually have an automated testing suite. At the moment, all the errors we intend to catch are created by one of the files in `valhalla_tests/*.c`.
 They should be compiled with:
 ```bash
