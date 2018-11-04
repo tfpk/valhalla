@@ -251,7 +251,8 @@ def memcheck_invalid_access(error_xml):
         return None
 
     err_type = "Invalid Write"
-    err_exp = f"You tried to {access} memory in a place which is not allowed (you tried to access {match.num} bytes {match.relative} the {match.size} bytes {match.func}'d). Ensure you alloc enough space, or make sure you never {access} outside the space.\n{Style.BRIGHT}You allocated the memory here:{Style.RESET_ALL}\n{pretty_print_stack(created_stack)}"
+    err_exp = (f"You tried to {access} memory in a place which is not allowed (you tried to access {match.num} bytes {match.relative} the {match.size} bytes {match.func}'d).\n"
+               f" Ensure you alloc enough space, or make sure you never {access} outside the space. If you are mallocing a struct, make sure you aren't mallocing a pointer to that struct.\n{Style.BRIGHT}You allocated the memory here:{Style.RESET_ALL}\n{pretty_print_stack(created_stack)}")
     
     return Error(error_xml, unique, stack, err_type, err_exp)
 
