@@ -338,8 +338,8 @@ def get_error_count(count, total):
 ERROR_FORMAT = f"""
 {Style.BRIGHT+Fore.RED}{{error_type}}{Style.RESET_ALL} at {{location}}
 {{error}}
-{Style.BRIGHT}Explaination:{Style.RESET_ALL} {{general_explaination}}
-{Style.BRIGHT}Error occured at:{Style.RESET_ALL}
+{Style.BRIGHT+Fore.CYAN}Explaination:{Style.RESET_ALL} {{general_explaination}}
+{Style.BRIGHT+Fore.CYAN}Error occured at:{Style.RESET_ALL}
 {{stack_trace}}
 {{error_count}}
 ~~~"""
