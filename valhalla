@@ -7,6 +7,7 @@ import traceback
 
 import xml.etree.ElementTree as ET
 from collections import namedtuple
+
 Frame = namedtuple('Frame', ['file', 'function', 'line', 'local'])
 Error = namedtuple('Error', ['xml', 'unique', 'stack', 'err_type', 'err_exp'])
 CouldNotCompute = namedtuple('CouldNotCompute', ['handler', 'traceback'])
@@ -14,7 +15,7 @@ CouldNotCompute = namedtuple('CouldNotCompute', ['handler', 'traceback'])
 from colorama import *
 init()
 
-KIND = 'kind'
+KIND = 'kind' 
 STACK = 'stack'
 ERROR = 'error'
 FRAME = 'frame'
@@ -23,6 +24,13 @@ AUXWHAT = 'auxwhat'
 UNIQUE = 'unique'
 
 VALHALLA_HEADER = f"{Style.BRIGHT+Fore.WHITE}[VALHALLA]{Style.RESET_ALL}"
+
+# register functions
+
+MEMCHECK_EXPLAINATIONS = []
+def register_explaination(f):
+    MEMCHECK_EXPLAINATIONS.append(f)
+    return f
 
 # helper model functions
 
@@ -106,7 +114,7 @@ def get_location(stack):
         if frame.local:
             return f"{frame.file}({frame.function}):{frame.line}"
     else:
-        return "No local functions."
+        return "[No local functions]"
 
 def pretty_print_stack(stack):
     lines = []
@@ -127,6 +135,7 @@ def pretty_print_stack(stack):
 
 # memcheck error definitions
 
+@register_explaination
 def memcheck_overlap(error_xml):
     def match(error_xml):
         return error_xml.find(KIND).text == "Overlap"
@@ -143,6 +152,7 @@ def memcheck_overlap(error_xml):
     return Error(error_xml, unique, stack, err_type, err_exp)
 
 
+@register_explaination
 def memcheck_double_free(error_xml):
     def match(error_xml):
         stacks = list(error_xml.findall(STACK))
@@ -162,6 +172,7 @@ def memcheck_double_free(error_xml):
     return Error(error_xml, unique, stack, err_type, err_exp)
 
 
+@register_explaination
 def memcheck_invalid_free(error_xml):
     def match(error_xml):
         stacks = list(error_xml.findall(STACK))
@@ -188,6 +199,7 @@ def memcheck_invalid_free(error_xml):
 
     return Error(error_xml, unique, stack, err_type, err_exp)
 
+@register_explaination
 def memcheck_stack_free(error_xml):
     def match(error_xml):
         stacks = list(error_xml.findall(STACK))
@@ -204,10 +216,11 @@ def memcheck_stack_free(error_xml):
     
     err_type = "Invalid Free On Stack"
     location = aux_whats[1].text
-    err_exp = f"You tried to free memory, but that memory is defined on the stack. You can only free memory on the heap (allocated by malloc/calloc) It was defined {location}."
+    err_exp = f"You tried to free memory, but that memory is defined on the stack. You can only free memory on the heap (allocated by malloc/calloc). It was defined {location}."
    
     return Error(error_xml, unique, stack, err_type, err_exp)
 
+@register_explaination
 def memcheck_fishy(error_xml):
     def match(error_xml):
         return error_xml.find(KIND).text == "FishyValue"
@@ -228,6 +241,7 @@ def memcheck_fishy(error_xml):
 
 
 
+@register_explaination
 def memcheck_invalid_access(error_xml):
     def match(error_xml):
         return error_xml.find(KIND).text in ["InvalidRead", "InvalidWrite"]
@@ -250,13 +264,15 @@ def memcheck_invalid_access(error_xml):
     if match is None:
         return None
 
-    err_type = "Invalid Write"
+    err_type = "Invalid Access"
     err_exp = (f"You tried to {access} memory in a place which is not allowed (you tried to access {match.num} bytes {match.relative} the {match.size} bytes {match.func}'d).\n"
-               f" Ensure you alloc enough space, or make sure you never {access} outside the space. If you are mallocing a struct, make sure you aren't mallocing a pointer to that struct.\n{Style.BRIGHT}You allocated the memory here:{Style.RESET_ALL}\n{pretty_print_stack(created_stack)}")
+            f" Ensure you alloc enough space, or make sure you never {access} outside the space. If you are mallocing a struct, make sure you aren't mallocing a pointer to that struct.\n"
+            f"{Style.BRIGHT}You allocated the memory here:{Style.RESET_ALL}\n{pretty_print_stack(created_stack)}")
     
     return Error(error_xml, unique, stack, err_type, err_exp)
 
 
+@register_explaination
 def memcheck_definitely_lost(error_xml):
     def match(error_xml):
         return error_xml.find(KIND).text == "Leak_DefinitelyLost"
@@ -276,6 +292,7 @@ def memcheck_definitely_lost(error_xml):
     
     return Error(error_xml, unique, stack, err_type, err_exp)
 
+@register_explaination
 def memcheck_indirectly_lost(error_xml):
     def match(error_xml):
         return error_xml.find(KIND).text == "Leak_IndirectlyLost"
@@ -295,16 +312,113 @@ def memcheck_indirectly_lost(error_xml):
     
     return Error(error_xml, unique, stack, err_type, err_exp)
 
-memcheck_explainations = [
-    memcheck_overlap,
-    memcheck_invalid_free,
-    memcheck_double_free,
-    memcheck_stack_free,
-    memcheck_fishy,
-    memcheck_invalid_access,
-    memcheck_definitely_lost,
-    memcheck_indirectly_lost,
-]
+@register_explaination
+def memcheck_syscall_param(error_xml):
+    def match(error_xml):
+        return error_xml.find(KIND).text == "SyscallParam"
+
+    if not match(error_xml):
+        return None
+
+    unique = error_xml.find(UNIQUE).text
+    
+    stack = get_stack(error_xml.findall(STACK)[0])
+    aux_stacks = map(get_stack, error_xml.findall(STACK)[1:])
+
+    what_text = error_xml.find(WHAT).text
+    func_match = re.search(r'(?P<func>[\w_]*)\((?P<param>[\w_]*)\)', what_text)
+
+    what_func = func_match.group('func')
+    what_param = func_match.group('param')
+    
+    err_type = "Bad Paramater to a syscall"
+    err_exp = f"You used a syscall ({what_func}), and the parameter {what_param} was not initialized. You should check that you set its value.\n"
+    
+    if "contains" in what_text:
+        # update me
+        err_exp += f"The paramater was initalized on the stack, here: \n"
+        err_exp += pretty_print_stack(get_stack(error_xml.find(AUXWHAT)))
+    elif "points to" in what_text:
+        err_exp += f"The paramater was initalized on the heap (that is, with calloc/malloc), here: \n"
+    else:
+        return None
+
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+@register_explaination
+def memcheck_uninit_cond(error_xml):
+    def match(error_xml):
+        return error_xml.find(KIND).text == "UninitCondition"
+
+    if not match(error_xml):
+        return None
+
+    unique = error_xml.find(UNIQUE).text
+    
+    stack = get_stack(error_xml.findall(STACK)[0])
+    aux_stacks = list(map(get_stack, error_xml.findall(STACK)[1:]))
+
+    what_text = error_xml.find(WHAT).text
+    auxwhat_text = error_xml.find(AUXWHAT).text
+    
+    err_type = "Uninitialized Condition"
+   
+    err_exp = ""
+    aux_stack_print = pretty_print_stack(aux_stacks[0])
+    if "stack" in auxwhat_text:
+        err_exp += f"A paramater was declared without a value on the stack, here: \n{aux_stack_print}\n"
+    elif "heap" in auxwhat_text:
+        err_exp += f"A paramater was declared without a value on the heap (that is, with calloc/malloc), here: \n{aux_stack_print}\n"
+    else:
+        return None
+    
+    err_exp += f"You used it in a conditional statement (for instance if or while), here:\n"
+
+    return Error(error_xml, unique, stack, err_type, err_exp)
+
+@register_explaination
+def memcheck_uninit_value(error_xml):
+    def match(error_xml):
+        return error_xml.find(KIND).text == "UninitValue"
+
+    if not match(error_xml):
+        return None
+
+    unique = error_xml.find(UNIQUE).text
+    
+    stack = get_stack(error_xml.findall(STACK)[0])
+    aux_stacks = list(map(get_stack, error_xml.findall(STACK)[1:]))
+
+    what_text = error_xml.find(WHAT).text
+    auxwhat_text = error_xml.find(AUXWHAT).text
+    
+    err_type = "Uninitialized Value"
+  
+    size = re.search(r'of size (\d*)', what_text)
+    if size is None:
+        return None
+    print("MATCHED")
+    size = int(size.groups()[0])
+
+    SIZE_MAPPING = {
+        1: ' (probably a char)',
+        4: ' (probably an int, float, or long)',
+        8: ' (probably a double)',
+    }
+    size_text = SIZE_MAPPING.get(size, "")
+    
+    aux_stack_print = pretty_print_stack(aux_stacks[0])
+    err_exp = ""
+    if "stack" in auxwhat_text:
+        err_exp += f"A paramater of size {size} bytes{size_text} was declared without a value on the stack, here: \n{aux_stack_print}\n"
+    elif "heap" in auxwhat_text:
+        err_exp += f"A paramater of size {size} bytes{size_text} was declared without a value on the heap (that is, with calloc/malloc), here: \n{aux_stack_print}\n"
+    else:
+        return None
+    
+    err_exp += f"You then used it in your program, without assigning it a value, here:\n"
+
+    return Error(error_xml, unique, stack, err_type, err_exp)
 
 # View
 
@@ -377,7 +491,7 @@ if __name__ == "__main__":
 
     for error_xml in tree.findall(ERROR):
         errors_found = 0
-        for exp in memcheck_explainations:
+        for exp in MEMCHECK_EXPLAINATIONS:
             try:
                 result = exp(error_xml)
                 if result is not None:
