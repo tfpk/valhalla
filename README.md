@@ -21,6 +21,14 @@ Valhalla is a wrapper around valgrind, so it is called in the same way. Argument
 valhalla ./my_program
 ```
 
+### Easy Install
+
+Too lazy/busy to install it yourself? Just copy this script!
+
+```bash
+(mkdir ~/.valhalla && cd ~/.valhalla && git clone https://github.com/tfpk/valhalla.git . && echo "alias valhalla=~/.valhalla/valhalla" >> ~/.bashrc && source ~/.bashrc); cd -
+```
+
 ## Tests
 
 To see the program in action:
