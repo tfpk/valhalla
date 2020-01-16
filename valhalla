@@ -420,6 +420,49 @@ def memcheck_uninit_value(error_xml):
 
     return Error(error_xml, unique, stack, err_type, err_exp)
 
+# Filtering
+
+ALL_LINES=-1
+
+def parse_filter_notation(filter_text):
+    parts = filter_text.split(':')
+    file_name = parts[0]
+    lines = [-1]
+    if len(parts) > 2:
+        raise ValueError("Can't have more than two parts.")
+    if len(parts) == 2:
+        file_lines = parts[1].split('-')
+        start = None
+        end = None
+        if len(file_lines) > 2:
+            raise ValueError("Can't have more than two line endpoints")
+        if len(file_lines) == 2:
+            start, end = file_lines
+        else:
+            start, end = file_lines*2
+
+        try:
+            start = int(start)
+            end = int(end)
+        except ValueError:
+            raise ValueError("Start and End must be integers")
+        
+        lines = list(range(start, end+1))
+
+    return file_name, lines
+
+
+def is_filtered(error, filter_lines):
+    for frame in error.stack:
+        for f in filter_lines or {}:
+            if f in frame.file or f in frame.function:
+                if -1 in filter_lines[f]:
+                    return True
+                if frame.line in filter_lines[f]:
+                    return True
+
+    return False
+
 # View
 
 VALGRIND_ERROR_HEADER = "=={pid}== {error}\n"
@@ -465,15 +508,39 @@ VALGRIND_CMD = "valgrind --leak-check=full --show-leak-kinds=all --xml=yes --xml
 if __name__ == "__main__":
     print(f"{Style.BRIGHT}"+"="*15+"[ VALHALLA ]"+"="*15+f"{Style.RESET_ALL}")
     print(f"{Style.DIM}Valhalla was created by @tfpk in 2018.{Style.RESET_ALL}")
-    start_from = 1
     tree = None
-    if sys.argv[start_from] == '--xml-file':
+    filter_lines = None
+    VALHALLA_XML_FILE_SETTING = '--valhalla-xml-file'
+    VALHALLA_INCLUDE_ONLY_SETTING = '--valhalla-filter='
+    
+    for arg in sys.argv:
+        if VALHALLA_INCLUDE_ONLY_SETTING not in arg:
+            continue
+        sys.argv.remove(arg)
+        arg = arg.replace(VALHALLA_INCLUDE_ONLY_SETTING, '')
+        filter_lines = filter_lines or {}
+        try:
+            f, lines = parse_filter_notation(arg)
+            filter_lines[f] = set(filter_lines.get(f, []) + lines)
+        except ValueError:
+            print(f"{VALHALLA_HEADER} The filter {arg} was not recognised!")
+            sys.exit(1)
+
+    if VALHALLA_XML_FILE_SETTING in sys.argv:
         print(f"{VALHALLA_HEADER} Loading from existing xml file.")
-        start_from += 1
-        xml_debug_file = sys.argv[start_from]
+        file_index = sys.argv.index(VALHALLA_XML_FILE_SETTING) + 1
+        xml_debug_file = sys.argv[file_index]
+        sys.argv.remove(VALHALLA_XML_FILE_SETTING)
+        sys.argv.remove(xml_debug_file)
         tree = ET.parse(xml_debug_file)
+    elif '-h' in sys.argv:
+        print(f"""\
+{VALHALLA_HEADER} Help:
+Coming Soon!
+                """)
+        sys.exit(0)
     else:
-        args = ' '.join(sys.argv[start_from:])
+        args = ' '.join(sys.argv[1:])
         print(f"{VALHALLA_HEADER} running valgrind {args}.")
        
         command = VALGRIND_CMD.format(tmp=VALGRIND_XML, args=args)
@@ -520,6 +587,8 @@ if __name__ == "__main__":
             print(f"{VALHALLA_HEADER} The handler for this error ({error.handler}) had a bug. Please report it!")
             print(error.traceback)
             continue
+        if is_filtered(error, filter_lines):
+            continue
 
         format_dict = {}
         format_dict['error_type'] = error.err_type
@@ -531,5 +600,6 @@ if __name__ == "__main__":
             format_dict['error_count'] = get_error_count(err_count[error.unique], num_errors)
         else:
             format_dict['error_count'] = ""
+
         print(ERROR_FORMAT.format(**format_dict))
 
