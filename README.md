@@ -21,6 +21,11 @@ Valhalla is a wrapper around valgrind, so it is called in the same way. Argument
 valhalla ./my_program
 ```
 
+### Example
+
+![Example](example.png)
+
+
 ### Easy Install
 
 Too lazy/busy to install it yourself? Just copy this script!
